@@ -1,0 +1,2 @@
+# pictl uses only the Python 3 standard library. This file exists so
+# CI/tooling that expects a requirements.txt doesn't error out.
