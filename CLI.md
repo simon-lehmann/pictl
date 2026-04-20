@@ -147,5 +147,3 @@ to anonymous HTTPS).
 ## Tips
 
 - Pipe output through `python3 -m json.tool` for pretty-printing.
-- The HTTP shim (`shim.py`) is a thin translator over this CLI; every
-  field documented here is what the Worker / app also sees.

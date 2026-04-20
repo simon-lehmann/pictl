@@ -2,8 +2,7 @@
 """pictl — Raspberry-Pi-side controller for Claude Code sessions.
 
 Every subcommand prints a single JSON object to stdout and exits 0 on
-success. Failures print `{"error": "<msg>"}` and exit 1. The HTTP shim
-and the React Native app both rely on this contract.
+success. Failures print `{"error": "<msg>"}` and exit 1.
 
 Subcommands:
   stats
