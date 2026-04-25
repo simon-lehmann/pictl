@@ -3,6 +3,10 @@
 URLs are stored in their canonical "host/owner/repo" form (no scheme,
 no .git suffix). Clone URLs are constructed at the point of use so a
 PAT swap takes effect immediately without rewriting config.
+
+The PAT itself never appears in argv: we hand it to git through
+`GIT_ASKPASS` (see `storage.git_env`), so `ps`, audit logs, and crash
+dumps don't capture it.
 """
 
 from __future__ import annotations
@@ -47,14 +51,15 @@ def _repo_name_from_url(url: str) -> str:
     return last
 
 
-def clone_url(repo: dict[str, Any], token: str | None) -> str:
-    """Construct the https clone URL, embedding a PAT if provided."""
+def clone_url(repo: dict[str, Any]) -> str:
+    """Construct the https clone URL. Auth is supplied via env, not URL."""
     canonical = _normalize_url(repo["url"])
-    if token:
-        # Use "x-access-token" as the username; GitHub ignores the
-        # username so this is a safe convention across providers.
-        return f"https://x-access-token:{token}@{canonical}.git"
     return f"https://{canonical}.git"
+
+
+def _credential_env(repo: dict[str, Any]) -> dict[str, str]:
+    token = pats.get_token(repo["pat_id"]) if repo.get("pat_id") else None
+    return storage.git_env(token)
 
 
 def _find(repos: list[dict[str, Any]], repo_id: str) -> dict[str, Any] | None:
@@ -103,6 +108,43 @@ def add_repo(url: str, pat_id: str | None = None) -> dict[str, Any]:
     return entry
 
 
+def update_repo(
+    repo_id: str,
+    url: str | None = None,
+    pat_id: str | None = None,
+    clear_pat: bool = False,
+) -> dict[str, Any]:
+    """Mutate an existing repo record.
+
+    `pat_id=None` leaves the existing PAT alone. Pass `clear_pat=True`
+    to detach the PAT (anonymous clones thereafter).
+    """
+    if url is None and pat_id is None and not clear_pat:
+        raise PictlError("nothing to update: pass --url, --pat, or --clear-pat")
+
+    with storage.config_transaction() as cfg:
+        repo = _find(cfg.get("repos", []), repo_id)
+        if not repo:
+            raise PictlError(f"repo '{repo_id}' not found")
+
+        if pat_id is not None:
+            existing_pats = cfg.get("pats", [])
+            if not any(p["id"] == pat_id for p in existing_pats):
+                raise PictlError(f"PAT '{pat_id}' not found")
+            repo["pat_id"] = pat_id
+        elif clear_pat:
+            repo["pat_id"] = None
+
+        if url is not None:
+            canonical = _normalize_url(url)
+            repo["url"] = canonical
+            repo["name"] = _repo_name_from_url(canonical)
+
+        result = dict(repo)
+
+    return result
+
+
 def remove_repo(repo_id: str) -> dict[str, Any]:
     # Check running sessions outside of the config lock so we don't
     # hold both locks at once.
@@ -131,13 +173,13 @@ def remove_repo(repo_id: str) -> dict[str, Any]:
 
 def list_branches(repo_id: str) -> dict[str, Any]:
     repo = get_repo(repo_id)
-    token = pats.get_token(repo["pat_id"]) if repo.get("pat_id") else None
-    url = clone_url(repo, token)
+    url = clone_url(repo)
+    env = _credential_env(repo)
 
     try:
         proc = subprocess.run(
             ["git", "ls-remote", "--heads", url],
-            capture_output=True, text=True, timeout=30, check=False,
+            capture_output=True, text=True, timeout=30, check=False, env=env,
         )
     except FileNotFoundError:
         raise PictlError("git is not installed")
@@ -145,10 +187,7 @@ def list_branches(repo_id: str) -> dict[str, Any]:
         raise PictlError("timed out listing remote branches")
 
     if proc.returncode != 0:
-        # Strip token from any error message before surfacing it.
         stderr = proc.stderr.strip()
-        if token:
-            stderr = stderr.replace(token, "***")
         raise PictlError(f"git ls-remote failed: {stderr or 'unknown error'}")
 
     branches: list[str] = []

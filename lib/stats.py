@@ -3,10 +3,17 @@
 Returns a flat dict suitable for `pictl stats`. Every field has a
 sensible fallback so a missing file or missing vcgencmd never takes the
 whole command down.
+
+CPU sampling: a naive implementation sleeps 0.5 s on every call to
+diff /proc/stat against itself. For a UI polling once a second that's
+half the wall time. Instead we cache the last (idle, total, mono_ts)
+sample to a file under PICTL_HOME and diff against it. If the cache is
+missing or > CPU_CACHE_MAX_AGE_S old, we fall back to the slow path.
 """
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import time
@@ -14,6 +21,11 @@ from pathlib import Path
 from typing import Any
 
 from . import storage
+
+
+CPU_CACHE_PATH = storage.DATA_DIR / ".cpu-sample.json"
+CPU_CACHE_MAX_AGE_S = 30.0
+CPU_SLOW_SAMPLE_S = 0.5
 
 
 def _read_proc_stat() -> tuple[int, int]:
@@ -27,16 +39,53 @@ def _read_proc_stat() -> tuple[int, int]:
     return idle, total
 
 
-def cpu_percent(sample_seconds: float = 0.5) -> float:
+def _read_cpu_cache() -> tuple[int, int, float] | None:
     try:
-        idle1, total1 = _read_proc_stat()
-        time.sleep(sample_seconds)
-        idle2, total2 = _read_proc_stat()
-        dt = total2 - total1
-        if dt <= 0:
-            return 0.0
-        di = idle2 - idle1
-        return round(100.0 * (1.0 - di / dt), 1)
+        with open(CPU_CACHE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return int(data["idle"]), int(data["total"]), float(data["mono"])
+    except (OSError, ValueError, KeyError, json.JSONDecodeError):
+        return None
+
+
+def _write_cpu_cache(idle: int, total: int, mono: float) -> None:
+    storage.ensure_dirs()
+    try:
+        with open(CPU_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump({"idle": idle, "total": total, "mono": mono}, f)
+    except OSError:
+        pass
+
+
+def cpu_percent() -> float:
+    """Diff against a cached prior sample for sub-millisecond reads.
+
+    Falls back to the legacy 0.5 s sleep if no usable cache exists.
+    """
+    try:
+        idle_now, total_now = _read_proc_stat()
+        mono_now = time.monotonic()
+        cache = _read_cpu_cache()
+        try:
+            if cache:
+                idle_prev, total_prev, mono_prev = cache
+                age = mono_now - mono_prev
+                if 0 < age <= CPU_CACHE_MAX_AGE_S:
+                    dt = total_now - total_prev
+                    di = idle_now - idle_prev
+                    if dt > 0:
+                        return round(100.0 * (1.0 - di / dt), 1)
+            # Cache missing/stale/zero-delta: take a fresh slow sample.
+            time.sleep(CPU_SLOW_SAMPLE_S)
+            idle2, total2 = _read_proc_stat()
+            dt = total2 - total_now
+            di = idle2 - idle_now
+            idle_now, total_now, mono_now = idle2, total2, time.monotonic()
+            if dt <= 0:
+                return 0.0
+            return round(100.0 * (1.0 - di / dt), 1)
+        finally:
+            _write_cpu_cache(idle_now, total_now, mono_now)
     except (OSError, ValueError):
         return 0.0
 
@@ -107,11 +156,16 @@ def uptime_seconds() -> int:
         return 0
 
 
-def active_session_count() -> int:
-    """Count sessions whose status is 'running' AND whose PID is alive."""
-    data = storage.read_sessions()
+def active_session_count(sessions_data: dict[str, Any] | None = None) -> int:
+    """Count sessions whose status is 'running' AND whose PID is alive.
+
+    Pass `sessions_data` (the result of `storage.read_sessions()`) to
+    avoid an extra read+lock when called from `collect()`.
+    """
+    if sessions_data is None:
+        sessions_data = storage.read_sessions()
     n = 0
-    for s in data.get("sessions", []):
+    for s in sessions_data.get("sessions", []):
         if s.get("status") == "running" and storage.pid_alive(s.get("pid") or 0):
             n += 1
     return n
@@ -120,6 +174,7 @@ def active_session_count() -> int:
 def collect() -> dict[str, Any]:
     ram_used, ram_total = ram_usage()
     disk_used, disk_total = disk_usage("/")
+    sessions_data = storage.read_sessions()
     return {
         "cpu_percent": cpu_percent(),
         "ram_used_gb": ram_used,
@@ -128,5 +183,5 @@ def collect() -> dict[str, Any]:
         "disk_total_gb": disk_total,
         "temp_celsius": temperature_celsius(),
         "uptime_seconds": uptime_seconds(),
-        "active_sessions": active_session_count(),
+        "active_sessions": active_session_count(sessions_data),
     }

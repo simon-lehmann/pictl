@@ -1,0 +1,27 @@
+[project]
+name = "pictl"
+version = "0.2.0"
+description = "Raspberry-Pi-side controller for Claude Code sessions"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E501",  # line length is checked but not strict
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F401"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true
+warn_unused_ignores = true

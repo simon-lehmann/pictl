@@ -3,7 +3,7 @@
 A "session" is one Claude Code process running against a freshly-cloned
 working copy of a repo. Lifecycle:
 
-    (create) -> starting -> running -> stopped | dead | failed | cleaned
+    (create) -> starting -> cloning -> running -> stopped | dead | failed | cleaned
 
 `start` forks a detached worker that does the slow bits (clone, spawn
 claude, capture its remote-connection output) and returns immediately.
@@ -26,12 +26,14 @@ import time
 from pathlib import Path
 from typing import Any
 
-from . import pats, repos, storage
+from . import repos, storage
 from .errors import PictlError
 
 
 MAX_REMOTE_CODE_LINES = 40
 REMOTE_CODE_WAIT_SECONDS = 30
+REMOTE_CODE_GRACE_SECONDS = 2.0
+WORKER_OVERALL_TIMEOUT_SECONDS = 900  # 15 min absolute ceiling
 
 
 def _now_iso() -> str:
@@ -55,7 +57,7 @@ def _update_session(session_id: str, **fields: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Public: list / stop / cleanup / start
+# Public: list / stop / cleanup / start / logs
 # ---------------------------------------------------------------------------
 
 
@@ -67,7 +69,6 @@ def list_sessions() -> dict[str, Any]:
                 pid = s.get("pid")
                 if not pid or not storage.pid_alive(int(pid)):
                     s["status"] = "dead"
-        # Make a public copy (no internal-only fields today, but keep shape).
         sessions = [dict(s) for s in data.get("sessions", [])]
     return {"sessions": sessions}
 
@@ -125,6 +126,47 @@ def cleanup_session(session_id: str) -> dict[str, Any]:
     return {"id": session_id, "status": "cleaned"}
 
 
+def cleanup_dead() -> dict[str, Any]:
+    """Bulk-clean every session in a terminal state (dead/failed/stopped/cleaned)."""
+    sessions = storage.read_sessions().get("sessions", [])
+    terminal = {"dead", "failed", "stopped"}
+    cleaned: list[str] = []
+    errors: list[dict[str, str]] = []
+    for sess in sessions:
+        if sess.get("status") not in terminal:
+            continue
+        try:
+            cleanup_session(sess["id"])
+            cleaned.append(sess["id"])
+        except Exception as e:
+            errors.append({"id": sess["id"], "error": str(e)})
+
+    result: dict[str, Any] = {"cleaned": cleaned, "count": len(cleaned)}
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+def session_logs(session_id: str, tail_bytes: int = 8192) -> dict[str, Any]:
+    """Return path + tail of the claude.log for a session."""
+    sessions = storage.read_sessions()
+    sess = _find(sessions.get("sessions", []), session_id)
+    if not sess:
+        raise PictlError(f"session '{session_id}' not found")
+
+    sess_path = Path(sess.get("path") or storage.session_dir(session_id))
+    log_path = sess_path / "claude.log"
+    worker_log_path = sess_path / "worker.log"
+
+    return {
+        "id": session_id,
+        "log_path": str(log_path),
+        "worker_log_path": str(worker_log_path),
+        "claude_tail": _tail(log_path, tail_bytes),
+        "worker_tail": _tail(worker_log_path, tail_bytes),
+    }
+
+
 def start_session(repo_id: str, branch: str) -> dict[str, Any]:
     """Create the session record and fork a detached worker.
 
@@ -139,7 +181,6 @@ def start_session(repo_id: str, branch: str) -> dict[str, Any]:
 
     repo = repos.get_repo(repo_id)
 
-    # Reserve a unique session id and record.
     with storage.sessions_transaction() as data:
         existing = {s["id"] for s in data.get("sessions", [])}
         session_id = secrets.token_hex(3)
@@ -181,7 +222,6 @@ def start_session(repo_id: str, branch: str) -> dict[str, Any]:
 
 def _spawn_worker(session_id: str) -> None:
     """Launch a detached child that drives the session to 'running'."""
-    # Locate pictl.py so the worker can re-enter through the CLI.
     here = Path(__file__).resolve().parent.parent
     cli = here / "pictl.py"
 
@@ -197,11 +237,11 @@ def _spawn_worker(session_id: str) -> None:
         start_new_session=True,
         close_fds=True,
     )
-    # Parent returns; worker continues after pictl exits.
 
 
 def run_worker(session_id: str) -> int:
     """Clone repo + launch claude. Designed to be invoked by pictl CLI."""
+    started = time.monotonic()
     try:
         sessions = storage.read_sessions()
         sess = _find(sessions.get("sessions", []), session_id)
@@ -209,8 +249,8 @@ def run_worker(session_id: str) -> int:
             return 1
 
         repo = repos.get_repo(sess["repo_id"])
-        token = pats.get_token(repo["pat_id"]) if repo.get("pat_id") else None
-        url = repos.clone_url(repo, token)
+        url = repos.clone_url(repo)
+        env = repos._credential_env(repo)
 
         sess_path = Path(sess["path"])
         sess_path.mkdir(parents=True, exist_ok=True)
@@ -227,16 +267,13 @@ def run_worker(session_id: str) -> int:
                 url,
                 str(checkout),
             ],
-            capture_output=True, text=True, timeout=600,
+            capture_output=True, text=True, timeout=600, env=env,
         )
         if clone.returncode != 0:
-            stderr = clone.stderr
-            if token:
-                stderr = stderr.replace(token, "***")
             _update_session(
                 session_id,
                 status="failed",
-                error=f"git clone failed: {stderr.strip()[:500]}",
+                error=f"git clone failed: {clone.stderr.strip()[:500]}",
                 failed_at=_now_iso(),
             )
             return 1
@@ -265,15 +302,12 @@ def run_worker(session_id: str) -> int:
         finally:
             log_fh.close()
 
-        # Record the PID immediately so the UI can stop it mid-startup
-        # if needed.
         _update_session(session_id, pid=proc.pid)
 
         # ----- capture remote_code from claude's log -----
-        remote_code = _poll_remote_code(log_path, proc)
+        remote_code = _poll_remote_code(log_path, proc, started)
 
         if proc.poll() is not None and proc.returncode != 0:
-            # Claude exited before we got anything useful.
             tail = _tail(log_path, 2000)
             _update_session(
                 session_id,
@@ -293,7 +327,7 @@ def run_worker(session_id: str) -> int:
         )
         return 0
 
-    except Exception as e:  # last-resort guard: don't leave 'starting' orphans
+    except Exception as e:
         _update_session(
             session_id,
             status="failed",
@@ -303,18 +337,29 @@ def run_worker(session_id: str) -> int:
         return 1
 
 
-def _poll_remote_code(log_path: Path, proc: subprocess.Popen) -> str | None:
+def _poll_remote_code(
+    log_path: Path,
+    proc: subprocess.Popen,
+    started_at: float,
+) -> str | None:
     """Wait for claude to print its remote-connection details.
 
     Strategy: tail the log file for up to REMOTE_CODE_WAIT_SECONDS. Any
     line containing 'ssh ', 'https://', or 'claude.ai/' is a strong
-    signal. If we collect such lines, return the joined text; else None.
+    signal. Once we see the first match, keep reading for
+    REMOTE_CODE_GRACE_SECONDS so multi-line announcements (URL +
+    follow-up ssh line) are captured together.
+
+    The whole worker is also bounded by WORKER_OVERALL_TIMEOUT_SECONDS
+    so we never sit here forever if claude misbehaves.
     """
     deadline = time.monotonic() + REMOTE_CODE_WAIT_SECONDS
+    overall_deadline = started_at + WORKER_OVERALL_TIMEOUT_SECONDS
     seen_offset = 0
     captured: list[str] = []
+    grace_until: float | None = None
 
-    while time.monotonic() < deadline:
+    while time.monotonic() < deadline and time.monotonic() < overall_deadline:
         if proc.poll() is not None:
             break
         try:
@@ -336,11 +381,13 @@ def _poll_remote_code(log_path: Path, proc: subprocess.Popen) -> str | None:
                 if len(captured) >= MAX_REMOTE_CODE_LINES:
                     return "\n".join(captured)
 
+        # Once we've captured at least one line, keep reading for a
+        # short grace period to pick up follow-on lines, then return.
         if captured:
-            # Give claude a brief grace period to print follow-up lines,
-            # then return what we have.
-            time.sleep(0.5)
-            return "\n".join(captured)
+            if grace_until is None:
+                grace_until = time.monotonic() + REMOTE_CODE_GRACE_SECONDS
+            elif time.monotonic() >= grace_until:
+                return "\n".join(captured)
 
         time.sleep(0.25)
 

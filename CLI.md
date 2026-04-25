@@ -9,9 +9,9 @@ Ctrl-C). No flags are global — each subcommand parses its own.
 pictl <group> [action] [options]
 ```
 
-Groups: `stats`, `sessions`, `repos`, `pats`. (`_session_worker` exists
-but is internal — invoked by the detached worker fork; don't call it
-directly.)
+Groups: `stats`, `version`, `doctor`, `sessions`, `repos`, `pats`.
+(`_session_worker` exists but is internal — invoked by the detached
+worker fork; don't call it directly.)
 
 State lives under `~/.pictl/` (override with `PICTL_HOME`):
 
@@ -20,12 +20,38 @@ State lives under `~/.pictl/` (override with `PICTL_HOME`):
 ├── config.json        # repos + PATs (mode 0600, plaintext tokens)
 ├── sessions.json      # session metadata
 ├── sessions/<id>/     # cloned repo + claude logs, one dir per session
+├── .askpass.py        # GIT_ASKPASS shim — keeps PATs out of argv
+├── .cpu-sample.json   # cached /proc/stat sample
 └── .locks/            # advisory fcntl locks
 ```
 
 Writes are atomic (temp file + `os.replace`) and serialised by an
-advisory `fcntl` lock per data file, so concurrent invocations are
-safe.
+advisory `fcntl` lock per data file. Reads take a shared lock so
+concurrent reads don't block each other. If a JSON file ever fails to
+parse, it's renamed to `<name>.corrupt-<unix-ts>` (preserving the bad
+content for inspection) and the default shape is returned.
+
+PATs reach `git` via `GIT_ASKPASS`, never via the URL or argv — so
+`ps`, audit logs, and core dumps don't capture the token.
+
+---
+
+## Session lifecycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> starting: sessions start
+    starting --> cloning: worker forked
+    cloning --> running: claude --remote launched
+    cloning --> failed: clone error
+    running --> stopped: sessions stop
+    running --> dead: PID gone (reconciled by `list`)
+    running --> failed: claude exited non-zero
+    stopped --> cleaned: sessions cleanup
+    dead --> cleaned: sessions cleanup
+    failed --> cleaned: sessions cleanup
+    cleaned --> [*]
+```
 
 ---
 
@@ -35,9 +61,9 @@ safe.
 pictl stats
 ```
 
-Snapshot of the host. Samples CPU over ~0.5s; every field has a safe
-fallback so a missing `/proc` entry or absent `vcgencmd` never fails
-the command.
+Snapshot of the host. CPU is sampled by diffing `/proc/stat` against a
+cached prior sample (under `~/.pictl/.cpu-sample.json`); only the very
+first call after a long idle pays the 0.5 s sleep.
 
 | field             | type         | source                                  |
 | ----------------- | ------------ | --------------------------------------- |
@@ -52,51 +78,64 @@ the command.
 
 ---
 
+## `pictl version`
+
+```
+pictl version
+```
+
+Returns `{"version": "...", "commit": "abc1234"}` (commit is
+best-effort from `git rev-parse`; absent if the install is not a
+checkout).
+
+---
+
+## `pictl doctor`
+
+```
+pictl doctor
+```
+
+Runs a battery of environment checks:
+
+- Python ≥ 3.10
+- `git` on PATH
+- `claude` on PATH
+- temperature source (`vcgencmd` or `/sys/class/thermal`)
+- `~/.pictl` exists with mode 0700
+- `~/.pictl/config.json` mode 0600 (or absent)
+- `~/.local/bin` on `PATH`
+
+Each check has `{"name", "ok", "detail"}` plus `"hint"` when failing.
+Exits 1 if any check fails, 0 otherwise — convenient for shell guards.
+
+---
+
 ## `pictl sessions …`
 
 A session is one `claude --remote` process running against a
-freshly-cloned working copy. State machine:
-
-```
-starting → cloning → running → stopped | dead | failed | cleaned
-```
+freshly-cloned working copy.
 
 ### `sessions list`
 
-```
-pictl sessions list
-```
-
-Returns `{"sessions": [...]}`. Before returning, reconciles each
-`running` record against its PID — if the PID is gone the record is
-flipped to `dead` and persisted back to `sessions.json`.
+Returns `{"sessions": [...]}`. Reconciles each `running` record
+against its PID — if the PID is gone the record is flipped to `dead`
+and persisted back to `sessions.json`.
 
 ### `sessions start --repo <repo_id> --branch <name>`
 
-```
-pictl sessions start --repo a1b2c3 --branch main
-```
-
 Reserves an id, writes a `starting` record, and forks a detached
-worker that clones the repo, launches `claude --remote`, and tails
-the claude log for up to 30s looking for `ssh `, `https://`, or
-`claude.ai/` lines (capped at 40) to capture as `remote_code`.
-Returns immediately (~10ms) with:
+worker that clones the repo, launches `claude --remote`, and tails the
+claude log for up to 30s looking for `ssh `, `https://`, or
+`claude.ai/` lines (capped at 40) to capture as `remote_code`. On the
+first match the worker keeps reading for ~2 s grace so multi-line
+announcements (URL + ssh hint) are captured together. Returns
+immediately (~10ms).
 
-```json
-{"id": "...", "status": "starting", "pid": null,
- "remote_code": null, "path": "~/.pictl/sessions/<id>"}
-```
-
-Poll `sessions list` to watch the record transition. On failure the
-worker writes `status=failed` with an `error` field (and `log_tail`
-if claude exited early). Git/clone errors have the PAT scrubbed.
+The whole worker is bounded by a 15-minute ceiling so a misbehaving
+`claude --remote` can never hang it forever.
 
 ### `sessions stop <id>`
-
-```
-pictl sessions stop d4e5f6
-```
 
 `SIGTERM` the PID, wait up to 5s, then `SIGKILL`. Writes
 `status=stopped` and `stopped_at`. Errors if the session id is
@@ -104,46 +143,56 @@ unknown; a no-op on the process if it's already gone.
 
 ### `sessions cleanup <id>`
 
-```
-pictl sessions cleanup d4e5f6
-```
-
 Stops the session if still live, then `rm -rf`s
 `~/.pictl/sessions/<id>/` and removes the record from `sessions.json`.
-Returns `{"id": "...", "status": "cleaned"}`.
+
+### `sessions cleanup-dead`
+
+Bulk-cleans every session in a terminal state (`dead`, `failed`,
+`stopped`). Returns `{"cleaned": [...], "count": N}` and an
+`"errors"` array if any individual cleanup raised.
+
+### `sessions logs <id> [--tail N]`
+
+Returns paths + tails of `claude.log` and `worker.log`:
+
+```json
+{
+  "id": "...",
+  "log_path": "...",
+  "worker_log_path": "...",
+  "claude_tail": "...",
+  "worker_tail": "..."
+}
+```
+
+`--tail` is in bytes (default 8192).
 
 ---
 
 ## `pictl repos …`
 
 Repos are stored in canonical `host/owner/repo` form (no scheme, no
-`.git`). Clone URLs — including the PAT — are assembled at use time,
-so rotating a PAT takes effect immediately without rewriting config.
+`.git`). PATs are passed to git via `GIT_ASKPASS`, never by URL.
 
 ### `repos list`
-
-```
-pictl repos list
-```
 
 `{"repos": [{"id","name","url","pat_id"}, ...]}`.
 
 ### `repos add --url <url> [--pat <pat_id>]`
 
-```
-pictl repos add --url github.com/user/repo --pat 9f8e7d
-```
-
 Accepts `https://github.com/u/r`, `github.com/u/r`,
 `git@github.com:u/r.git`, with or without `.git`. Validates the PAT
-id if supplied. Returns the new record. Duplicate URLs are **not**
-rejected — add-dedup is caller-side.
+id if supplied. Duplicate URLs are **not** rejected — add-dedup is
+caller-side.
+
+### `repos update <id> [--url ...] [--pat ...] [--clear-pat]`
+
+Mutates an existing repo. Pass `--clear-pat` to detach the current
+PAT (subsequent clones go anonymous). At least one of the flags is
+required.
 
 ### `repos remove <id>`
-
-```
-pictl repos remove a1b2c3
-```
 
 Removes the record. If any session with status `running` or
 `starting` references it, the response includes a `warnings` array
@@ -151,14 +200,8 @@ listing those session ids — the repo is still removed.
 
 ### `repos branches <id>`
 
-```
-pictl repos branches a1b2c3
-```
-
-`git ls-remote --heads` against the stored URL (with the PAT injected
-if one is attached). Returns
-`{"repo_id": "...", "branches": ["main", ...]}`. 30s timeout. Errors
-scrub the token.
+`git ls-remote --heads` against the stored URL. Returns
+`{"repo_id": "...", "branches": ["main", ...]}`. 30s timeout.
 
 ---
 
@@ -169,26 +212,14 @@ Personal access tokens. Stored in plaintext in `~/.pictl/config.json`
 
 ### `pats list`
 
-```
-pictl pats list
-```
-
 `{"pats": [{"id","name","token_preview"}, ...]}`. Preview is
 `abcd...wxyz` (first-4…last-4), or `a…z` for tokens ≤ 8 chars.
 
 ### `pats add --name <label> --token <value>`
 
-```
-pictl pats add --name github --token ghp_xxxxxxxxxxxx
-```
-
 Both fields required. Returns the public (masked) record.
 
 ### `pats remove <id>`
-
-```
-pictl pats remove 9f8e7d
-```
 
 Removes the PAT. If any repo still references it, the response
 includes a `warnings` array listing those repo ids — the PAT is
@@ -203,6 +234,7 @@ to anonymous HTTPS).
 | ---- | -------------------------------------------------- |
 | 0    | success; JSON object on stdout                     |
 | 1    | `PictlError` or unknown action; `{"error": "..."}` |
+| 1    | `pictl doctor` reports any failing check           |
 | 130  | `KeyboardInterrupt`                                |
 
 ## Tips
@@ -210,3 +242,4 @@ to anonymous HTTPS).
 - Pipe output through `python3 -m json.tool` for pretty-printing.
 - Set `PICTL_HOME=/some/path` to relocate the data dir (useful for
   tests).
+- `pictl doctor` is the fastest way to diagnose a broken install.
