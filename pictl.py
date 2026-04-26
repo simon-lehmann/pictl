@@ -11,6 +11,7 @@ Subcommands:
   pats     list|add|remove
   doctor
   version
+  exec     --json '<{"command","action","args"}>'   (UI bridge)
   _session_worker <id>   (internal; invoked by the detached worker fork)
 """
 
@@ -129,6 +130,124 @@ def cmd_session_worker(args: argparse.Namespace) -> int:
 
 
 # ---------------------------------------------------------------------------
+# JSON dispatch (UI bridge)
+#
+# The argparse path above is the human contract: shell-friendly flags,
+# positional ids, kebab-case actions. UIs that already speak JSON would
+# have to re-encode every value as a flag string and parse stderr for
+# argparse errors. `pictl exec --json '<blob>'` is a second entry point
+# that takes a single object {command, action, args} and dispatches to
+# the *same* handlers, so the human and programmatic paths can never
+# drift on actual behaviour. Both go through `_dispatch`.
+# ---------------------------------------------------------------------------
+
+
+def _require(args: dict[str, Any], *names: str) -> tuple[Any, ...]:
+    missing = [n for n in names if n not in args]
+    if missing:
+        raise PictlError(f"missing required arg(s): {', '.join(missing)}")
+    return tuple(args[n] for n in names)
+
+
+def _dispatch(command: str, action: str | None, args: dict[str, Any]) -> Any:
+    """Route a (command, action, args) triple to the matching lib call.
+
+    Returns the same dict the argparse handlers print. Raises PictlError
+    on unknown command/action or missing args (mirrors how argparse would
+    fail on the human path, but with a structured message we control).
+    """
+    if command == "stats":
+        return stats.collect()
+    if command == "version":
+        return version.info()
+    if command == "doctor":
+        return doctor.run()
+
+    if command == "sessions":
+        if action == "list":
+            return sessions.list_sessions()
+        if action == "start":
+            (repo, branch) = _require(args, "repo", "branch")
+            return sessions.start_session(repo, branch)
+        if action == "stop":
+            (sid,) = _require(args, "id")
+            return sessions.stop_session(sid)
+        if action == "cleanup":
+            (sid,) = _require(args, "id")
+            return sessions.cleanup_session(sid)
+        if action == "cleanup-dead":
+            return sessions.cleanup_dead()
+        if action == "logs":
+            (sid,) = _require(args, "id")
+            tail = int(args.get("tail", 8192))
+            return sessions.session_logs(sid, tail_bytes=tail)
+        raise PictlError(f"unknown sessions action: {action}")
+
+    if command == "repos":
+        if action == "list":
+            return repos.list_repos()
+        if action == "add":
+            (url,) = _require(args, "url")
+            return repos.add_repo(url, args.get("pat"))
+        if action == "update":
+            (rid,) = _require(args, "id")
+            return repos.update_repo(
+                rid,
+                url=args.get("url"),
+                pat_id=args.get("pat"),
+                clear_pat=bool(args.get("clear_pat", False)),
+            )
+        if action == "remove":
+            (rid,) = _require(args, "id")
+            return repos.remove_repo(rid)
+        if action == "branches":
+            (rid,) = _require(args, "id")
+            return repos.list_branches(rid)
+        raise PictlError(f"unknown repos action: {action}")
+
+    if command == "pats":
+        if action == "list":
+            return pats.list_pats()
+        if action == "add":
+            (name, token) = _require(args, "name", "token")
+            return pats.add_pat(name, token)
+        if action == "remove":
+            (pid,) = _require(args, "id")
+            return pats.remove_pat(pid)
+        raise PictlError(f"unknown pats action: {action}")
+
+    raise PictlError(f"unknown command: {command}")
+
+
+def cmd_exec(args: argparse.Namespace) -> int:
+    try:
+        payload = json.loads(args.json)
+    except json.JSONDecodeError as e:
+        return _fail(f"exec --json: invalid JSON: {e.msg}")
+    if not isinstance(payload, dict):
+        return _fail("exec --json: payload must be an object")
+
+    command = payload.get("command")
+    if not isinstance(command, str):
+        return _fail("exec --json: 'command' must be a string")
+    action = payload.get("action")
+    if action is not None and not isinstance(action, str):
+        return _fail("exec --json: 'action' must be a string or omitted")
+    raw_args = payload.get("args") or {}
+    if not isinstance(raw_args, dict):
+        return _fail("exec --json: 'args' must be an object or omitted")
+
+    result = _dispatch(command, action, raw_args)
+    _emit(result)
+    # NOTE: unlike the argparse path (`pictl doctor` → exit 1 on any
+    # failed check, for shell guards), the JSON dispatcher always exits
+    # 0 on a successful dispatch. UIs inspect `ok: false` in the body —
+    # if we exited 1 here, the bridge's failure handler would scrape the
+    # body looking for `{"error": ...}` and surface a confusing message.
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argparse wiring
 # ---------------------------------------------------------------------------
 
@@ -205,6 +324,18 @@ def _build_parser() -> argparse.ArgumentParser:
     pa = psub.add_parser("remove", help="Delete a PAT")
     pa.add_argument("id", help="PAT id")
     pa.set_defaults(func=cmd_pats)
+
+    # exec (JSON dispatch — used by the mobile UI bridge)
+    ep = sub.add_parser(
+        "exec",
+        help="Run a command described as a JSON object (UI bridge)",
+    )
+    ep.add_argument(
+        "--json",
+        required=True,
+        help='JSON object: {"command":"...","action":"...","args":{...}}',
+    )
+    ep.set_defaults(func=cmd_exec)
 
     # internal: session worker
     sw = sub.add_parser("_session_worker", help=argparse.SUPPRESS)

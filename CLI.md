@@ -228,6 +228,37 @@ to anonymous HTTPS).
 
 ---
 
+## `pictl exec --json '<blob>'`
+
+JSON dispatch entry point used by the mobile UI bridge. The blob is one
+object: `{"command": "...", "action": "...", "args": {...}}`. Routes to
+the same handlers the argparse path uses, so behaviour can never drift
+between the human and programmatic surfaces.
+
+```
+pictl exec --json '{"command":"sessions","action":"start","args":{"repo":"abc123","branch":"main"}}'
+```
+
+`action` is omitted/ignored for groupless commands (`stats`, `version`,
+`doctor`). `args` is omitted or `{}` when nothing is needed.
+
+**Exit codes diverge from the argparse path on purpose for `doctor`:**
+the human form (`pictl doctor`) exits 1 on any failed check so shell
+guards work, but `pictl exec --json '{"command":"doctor"}'` always
+exits 0 on a successful dispatch. UIs read `ok: false` from the body —
+exiting 1 would force them into a generic error-path that has to scrape
+out the report.
+
+All other failure modes (unknown command, missing required arg, handler
+raising `PictlError`) still emit `{"error":"..."}` and exit 1.
+
+This exists because UIs already speak JSON: forcing them to re-encode
+each value as a `--flag` and then scrape argparse stderr for errors is
+busy-work that adds a second source of truth. With `exec --json`, the
+UI's request schema and the CLI's dispatch table model the same thing.
+
+---
+
 ## Exit codes
 
 | code | meaning                                            |
